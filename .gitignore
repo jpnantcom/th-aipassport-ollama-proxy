@@ -1,0 +1,16 @@
+node_modules/
+
+# Authentication material — never commit these files.
+auth/
+network-capture.md
+*-network.md
+
+# Playwright output
+test-results/
+playwright-report/
+blob-report/
+
+# Local environment files
+.env
+.env.*
+!.env.example
