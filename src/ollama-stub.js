@@ -1,12 +1,8 @@
-import { access } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
-import { request as playwrightRequest } from 'playwright';
-import Handlebars from 'handlebars';
-
 const defaultModelName = 'gemini-3.1-flash-lite';
-const destinationUrl = process.env.AIPASS_BASE_URL ?? 'https://de.aipass.net';
-const storageStatePath = new URL('../auth/storage-state.json', import.meta.url);
+const defaultDestinationUrl = 'https://de.aipass.net';
+const defaultAuthObjectKey = 'auth/storage-state.json';
+const maxJsonBodyBytes = 1024 * 1024;
+
 const generateAnswerTool = {
   type: 'function',
   function: {
@@ -24,45 +20,6 @@ const generateAnswerTool = {
     },
   },
 };
-Handlebars.registerHelper('functionSignature', (tool) => {
-  const functionDefinition = tool?.function ?? tool;
-  const name = functionDefinition?.name ?? 'unknown';
-  const properties = functionDefinition?.parameters?.properties ?? {};
-  return `${name}( ${Object.keys(properties).join(', ')} ) { }`;
-});
-Handlebars.registerHelper('functionDescription', (tool) => {
-  return (tool?.function ?? tool)?.description ?? 'No description provided.';
-});
-Handlebars.registerHelper('parameterLines', (tool) => {
-  const properties = (tool?.function ?? tool)?.parameters?.properties ?? {};
-  return Object.entries(properties).map(([name, parameter]) => {
-    let shape = parameter?.type ?? 'unknown';
-    if (parameter?.type === 'array' && parameter.items?.type) shape += `<${parameter.items.type}>`;
-    if (Array.isArray(parameter?.enum)) shape += `; values: ${parameter.enum.join(', ')}`;
-    const description = parameter?.description ?? 'No description provided.';
-    return `${name} (${shape}): ${description}`;
-  });
-});
-const initialMessageTemplate = Handlebars.compile(`##Additional Instruction for you
-{{{systemMessage}}}
-
-From this available library function
-{{#each tools}}
-{{{functionSignature this}}}
-Description: {{{functionDescription this}}}
-Parameters:
-{{#each (parameterLines this)}}
-- {{{this}}}
-{{/each}}
-
-{{/each}}
-
-Ensure that you satisfy this request:
-{{{userRequest}}}
-
-Generate code to perform the task. I will provide the result from invoking the function in my system.
-
-You can only create one function call at a time.`);
 
 function createModel(name = defaultModelName) {
   const modelName = typeof name === 'string' && name.trim() ? name.trim() : defaultModelName;
@@ -93,6 +50,21 @@ function chatMessage(request) {
   return typeof lastUserMessage?.content === 'string' ? lastUserMessage.content : '';
 }
 
+function toolDetails(tool) {
+  const definition = tool?.function ?? tool;
+  const name = definition?.name ?? 'unknown';
+  const properties = definition?.parameters?.properties ?? {};
+  const signature = `${name}( ${Object.keys(properties).join(', ')} ) { }`;
+  const description = definition?.description ?? 'No description provided.';
+  const parameters = Object.entries(properties).map(([parameterName, parameter]) => {
+    let shape = parameter?.type ?? 'unknown';
+    if (parameter?.type === 'array' && parameter.items?.type) shape += `<${parameter.items.type}>`;
+    if (Array.isArray(parameter?.enum)) shape += `; values: ${parameter.enum.join(', ')}`;
+    return `- ${parameterName} (${shape}): ${parameter?.description ?? 'No description provided.'}`;
+  });
+  return `${signature}\nDescription: ${description}\nParameters:\n${parameters.join('\n')}`;
+}
+
 export function initialConversationMessage(request, userRequest) {
   const messages = Array.isArray(request.body?.messages) ? request.body.messages : [];
   const systemMessages = messages
@@ -101,18 +73,27 @@ export function initialConversationMessage(request, userRequest) {
   if (typeof request.body?.system === 'string' && request.body.system.trim()) {
     systemMessages.unshift(request.body.system);
   }
-  const systemMessage = systemMessages.join('\n\n') || '(none provided)';
+  const systemMessage = systemMessages.join('\n\n');
   const requestedTools = Array.isArray(request.body?.tools) ? request.body.tools : [];
-  const tools = [generateAnswerTool, ...requestedTools.filter((tool) => {
+  const tools = requestedTools.filter((tool) => {
     const name = tool?.function?.name ?? tool?.name;
     return name !== generateAnswerTool.function.name;
-  })];
-
-  return initialMessageTemplate({
-    systemMessage,
-    tools,
-    userRequest,
   });
+
+  const sections = [];
+  if (systemMessage) sections.push(`##Additional Instruction for you\n${systemMessage}`);
+  if (tools.length) {
+    sections.push([
+      'From this available library function',
+      [generateAnswerTool, ...tools].map(toolDetails).join('\n\n'),
+      `Ensure that you satisfy this request:\n${userRequest}`,
+      'Generate code to perform the task. I will provide the result from invoking the function in my system.',
+      'You can only create one function call at a time.',
+    ].join('\n\n'));
+  } else if (userRequest) {
+    sections.push(userRequest);
+  }
+  return sections.join('\n\n');
 }
 
 export function finalAnswerFromAction(content) {
@@ -188,28 +169,10 @@ function parseDestinationStream(text) {
       const event = JSON.parse(payload);
       if (event.type === 'text-delta') content += event.delta ?? '';
     } catch {
-      // Ignore keepalive and malformed events, as test-chat.js does.
+      // Ignore keepalive and malformed events.
     }
   }
   return content;
-}
-
-async function postDestination(context, url, options) {
-  const upstreamResponse = await context.post(url, options);
-  const body = await upstreamResponse.text();
-  if (!upstreamResponse.ok()) {
-    const error = new Error(`Destination POST ${url} failed with HTTP ${upstreamResponse.status()}: ${body}`);
-    error.status = 502;
-    throw error;
-  }
-  return body;
-}
-
-async function getDestination(context, url) {
-  const upstreamResponse = await context.get(url);
-  const body = await upstreamResponse.text();
-  if (!upstreamResponse.ok()) return undefined;
-  return parseJson(body, `Destination GET ${url}`);
 }
 
 function readQuota(quota) {
@@ -240,177 +203,344 @@ function estimateTokenCount(text) {
   return Math.max(0, Math.ceil((text ?? '').length / 4));
 }
 
-async function proxyChat(request) {
-  try {
-    await access(storageStatePath);
-  } catch {
-    const error = new Error('Captured authentication is missing. Run "npm run login" first.');
+function isCookieApplicable(cookie, destination) {
+  const host = destination.hostname.toLowerCase();
+  const cookieDomain = typeof cookie?.domain === 'string' ? cookie.domain.replace(/^\./, '').toLowerCase() : '';
+  if (cookieDomain && host !== cookieDomain && !host.endsWith(`.${cookieDomain}`)) return false;
+  if (cookie.secure && destination.protocol !== 'https:') return false;
+
+  const cookiePath = typeof cookie.path === 'string' && cookie.path.startsWith('/') ? cookie.path : '/';
+  if (!destination.pathname.startsWith(cookiePath)) return false;
+  if (cookie.expires && Number(cookie.expires) > 0 && Number(cookie.expires) <= Date.now() / 1000) return false;
+  return typeof cookie.name === 'string' && cookie.name.length > 0 && typeof cookie.value === 'string';
+}
+
+async function loadAuthCookieHeader(env, destination) {
+  const bucket = env.AUTH_BUCKET;
+  if (!bucket || typeof bucket.get !== 'function') {
+    const error = new Error('The AUTH_BUCKET R2 binding is not configured.');
     error.status = 503;
     throw error;
   }
 
-  const startedAt = process.hrtime.bigint();
-  const modelId = process.env.AIPASS_MODEL ?? requestedModel(request);
+  let object;
+  try {
+    object = await bucket.get(env.AUTH_OBJECT_KEY || defaultAuthObjectKey);
+  } catch {
+    const error = new Error('Unable to load captured authentication from R2.');
+    error.status = 503;
+    throw error;
+  }
+  if (!object) {
+    const error = new Error('Captured authentication is missing from R2.');
+    error.status = 503;
+    throw error;
+  }
+
+  let authState;
+  try {
+    authState = await object.json();
+  } catch {
+    const error = new Error('The R2 authentication object is not valid JSON.');
+    error.status = 503;
+    throw error;
+  }
+  const cookies = Array.isArray(authState) ? authState : authState?.cookies;
+  if (!Array.isArray(cookies)) {
+    const error = new Error('The R2 authentication object must contain a cookies array.');
+    error.status = 503;
+    throw error;
+  }
+
+  const cookieHeader = cookies
+    .filter((cookie) => isCookieApplicable(cookie, destination))
+    .map((cookie) => `${cookie.name}=${cookie.value}`)
+    .join('; ');
+  if (!cookieHeader) {
+    const error = new Error('No unexpired cookies for the upstream host were found in R2 authentication.');
+    error.status = 503;
+    throw error;
+  }
+  return cookieHeader;
+}
+
+async function upstreamRequest(destination, cookieHeader, path, { method = 'GET', form, data, headers: extraHeaders = {}, userAgent } = {}) {
+  const url = new URL(path, destination);
+  if (url.origin !== destination.origin) throw new Error('Upstream request must remain on the configured origin.');
+
+  const headers = new Headers({
+    accept: 'application/json, text/plain, */*',
+    origin: destination.origin,
+    referer: new URL('/chat', destination).href,
+    cookie: cookieHeader,
+  });
+  for (const [name, value] of Object.entries(extraHeaders)) headers.set(name, value);
+  if (userAgent) headers.set('user-agent', userAgent);
+
+  let body;
+  if (form) {
+    body = new URLSearchParams(form);
+    headers.set('content-type', 'application/x-www-form-urlencoded');
+  } else if (data !== undefined) {
+    body = JSON.stringify(data);
+    headers.set('content-type', 'application/json');
+  }
+
+  const response = await fetch(url, { method, headers, body, redirect: 'manual' });
+  const responseBody = await response.text();
+  if (!response.ok) {
+    const error = new Error(`Destination ${method} ${url.pathname} failed with HTTP ${response.status}: ${responseBody}`);
+    error.status = 502;
+    throw error;
+  }
+  return responseBody;
+}
+
+async function getDestination(destination, cookieHeader, path, userAgent) {
+  const body = await upstreamRequest(destination, cookieHeader, path, { userAgent });
+  return parseJson(body, `Destination GET ${path}`);
+}
+
+async function proxyChat(request, env) {
+  const startedAt = performance.now();
+  let destination;
+  try {
+    destination = new URL(env.AIPASS_BASE_URL || defaultDestinationUrl);
+  } catch {
+    const error = new Error('AIPASS_BASE_URL must be a valid URL.');
+    error.status = 500;
+    throw error;
+  }
+  const cookieHeader = await loadAuthCookieHeader(env, destination);
+  const modelId = env.AIPASS_MODEL || requestedModel(request);
+  const userAgent = env.AIPASS_USER_AGENT;
   const message = chatMessage(request);
-  const context = await playwrightRequest.newContext({
-    baseURL: destinationUrl,
-    storageState: fileURLToPath(storageStatePath),
-    extraHTTPHeaders: {
-      accept: 'application/json, text/plain, */*',
-      origin: destinationUrl,
-      referer: `${destinationUrl}/chat`,
+
+  let quotaBefore;
+  try {
+    quotaBefore = readQuota(await getDestination(destination, cookieHeader, '/loaders/get-usage-quota', userAgent));
+  } catch {
+    quotaBefore = undefined;
+  }
+
+  let conversationId = conversationIdFromMessages(request);
+  const isNewConversation = !conversationId;
+  if (!conversationId) {
+    const createBody = parseJson(await upstreamRequest(destination, cookieHeader, '/chat.data', {
+      method: 'POST',
+      form: {
+        message: message.slice(0, 100),
+        folderId: '',
+        modelId,
+        intent: 'create-conversation',
+        clientCreateRequestId: crypto.randomUUID(),
+      },
+      userAgent,
+    }), 'Conversation creation');
+    conversationId = findProperty(createBody, 'conversationId');
+    if (!conversationId) {
+      const error = new Error('Conversation creation did not return a conversationId.');
+      error.status = 502;
+      throw error;
+    }
+  }
+
+  const streamedBody = await upstreamRequest(destination, cookieHeader, `/actions/send-message/${encodeURIComponent(conversationId)}`, {
+    method: 'POST',
+    headers: {
+      accept: 'text/event-stream',
+      referer: new URL(`/chat/${encodeURIComponent(conversationId)}`, destination).href,
+    },
+    userAgent,
+    data: {
+      modelId,
+      messages: [{
+        id: crypto.randomUUID(),
+        role: 'user',
+        metadata: { modelId },
+        parts: [{
+          type: 'text',
+          text: isNewConversation ? initialConversationMessage(request, message) || message : message,
+        }],
+      }],
     },
   });
 
+  let quotaAfter;
   try {
-    let quotaBefore;
-    try {
-      quotaBefore = readQuota(await getDestination(context, '/loaders/get-usage-quota'));
-    } catch {
-      quotaBefore = undefined;
-    }
+    quotaAfter = readQuota(await getDestination(destination, cookieHeader, '/loaders/get-usage-quota', userAgent));
+  } catch {
+    quotaAfter = undefined;
+  }
 
-    let conversationId = conversationIdFromMessages(request);
-    const isNewConversation = !conversationId;
-    if (!conversationId) {
-      const createBody = parseJson(await postDestination(context, '/chat.data', {
-        form: {
-          message: message.slice(0, 100),
-          folderId: '',
-          modelId,
-          intent: 'create-conversation',
-          clientCreateRequestId: randomUUID(),
-        },
-      }), 'Conversation creation');
-      conversationId = findProperty(createBody, 'conversationId');
-      if (!conversationId) {
-        const error = new Error('Conversation creation did not return a conversationId.');
-        error.status = 502;
-        throw error;
-      }
-    }
+  return {
+    model: request.body?.model ?? modelId,
+    conversationId,
+    content: finalAnswerFromAction(parseDestinationStream(streamedBody)),
+    quotaUsage: calculateQuotaUsage(quotaBefore, quotaAfter),
+    totalDuration: Math.max(0, Math.round((performance.now() - startedAt) * 1_000_000)),
+  };
+}
 
-    const streamedBody = await postDestination(
-      context,
-      `/actions/send-message/${encodeURIComponent(conversationId)}`,
-      {
-        headers: {
-          accept: 'text/event-stream',
-          referer: `${destinationUrl}/chat/${conversationId}`,
-        },
-        data: {
-          modelId,
-          messages: [{
-            id: randomUUID(),
-            role: 'user',
-            metadata: { modelId },
-            parts: [{
-              type: 'text',
-              text: isNewConversation ? initialConversationMessage(request, message) : message,
-            }],
-          }],
-        },
-      },
-    );
-    let quotaAfter;
-    try {
-      quotaAfter = readQuota(await getDestination(context, '/loaders/get-usage-quota'));
-    } catch {
-      quotaAfter = undefined;
-    }
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    },
+  });
+}
 
-    return {
-      model: request.body?.model ?? modelId,
-      conversationId,
-      content: finalAnswerFromAction(parseDestinationStream(streamedBody)),
-      quotaUsage: calculateQuotaUsage(quotaBefore, quotaAfter),
-      totalDuration: Number(process.hrtime.bigint() - startedAt),
-    };
-  } finally {
-    await context.dispose();
+function errorResponse(error) {
+  const status = Number.isInteger(error?.status) ? error.status : 500;
+  return jsonResponse({ error: error?.message ?? 'Internal server error' }, status);
+}
+
+function apiPath(pathname) {
+  if (pathname === '/api') return '/';
+  return pathname.startsWith('/api/') ? pathname.slice('/api'.length) : pathname;
+}
+
+async function readJsonBody(request) {
+  const contentLength = Number(request.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > maxJsonBodyBytes) {
+    const error = new Error('Request body must not exceed 1 MB.');
+    error.status = 413;
+    throw error;
+  }
+
+  if (!request.body) return {};
+  const reader = request.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    totalBytes += value.byteLength;
+    if (totalBytes > maxJsonBodyBytes) {
+      await reader.cancel();
+      const error = new Error('Request body must not exceed 1 MB.');
+      error.status = 413;
+      throw error;
+    }
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(bytes));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      const error = new Error('Request body must be a JSON object.');
+      error.status = 400;
+      throw error;
+    }
+    return parsed;
+  } catch (error) {
+    if (error.status) throw error;
+    const invalidJsonError = new Error('Request body must be valid JSON.');
+    invalidJsonError.status = 400;
+    throw invalidJsonError;
   }
 }
 
-export function createOllamaRouter({ proxyChat: shouldProxyChat = true } = {}) {
-  return async (request, response, next) => {
-    const path = request.path;
+export async function handleOllamaRequest(request, env = {}, options = {}) {
+  const url = new URL(request.url);
+  const path = apiPath(url.pathname);
+  if (path === '/health' && request.method === 'GET') return jsonResponse({ status: 'ok' });
+  if (!url.pathname.startsWith('/api/')) return jsonResponse({ error: 'Not found' }, 404);
 
-    if (path === '/chat') {
-      if (shouldProxyChat) {
-        try {
-          const result = await proxyChat(request);
-          const responseBody = {
-            model: result.model,
-            created_at: new Date().toISOString(),
-            message: {
-              role: 'assistant',
-              content: withConversationSession(result.content, result.conversationId),
-            },
-            done: true,
-            done_reason: 'stop',
-            total_duration: result.totalDuration,
-            load_duration: 0,
-            prompt_eval_count: estimateTokenCount(chatMessage(request)),
-            prompt_eval_duration: 0,
-            eval_count: result.quotaUsage?.raw_credits_used ?? estimateTokenCount(result.content),
-            eval_duration: result.totalDuration,
-          };
-          if (request.body?.stream === false) return response.json(responseBody);
-          response.type('application/x-ndjson');
-          const finalChunk = {
-            ...responseBody,
-            message: { role: 'assistant', content: '' },
-          };
-          return response.send(`${JSON.stringify({ ...responseBody, done: false })}\n${JSON.stringify(finalChunk)}\n`);
-        } catch (error) {
-          return next(error);
-        }
-      }
+  const expectsBody = request.method === 'POST' && (path === '/chat' || path === '/show');
+  let body = {};
+  if (expectsBody) {
+    const contentType = request.headers.get('content-type') ?? '';
+    if (!contentType.toLowerCase().includes('application/json')) {
+      return jsonResponse({ error: 'Content-Type must be application/json.' }, 415);
+    }
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+  const apiRequest = { body };
 
-      const model = requestedModel(request);
+  if (path === '/chat') {
+    if (request.method !== 'POST') return jsonResponse({ error: 'Method not allowed' }, 405);
+    if (options.proxyChat === false) {
+      const model = requestedModel(apiRequest);
       const content = 'This is a stub response. Ollama inference is not connected yet.';
-      const result = {
+      const responseBody = {
         model,
         created_at: new Date().toISOString(),
         message: { role: 'assistant', content },
         done: true,
         total_duration: 0,
         load_duration: 0,
-        prompt_eval_count: chatMessage(request) ? 1 : 0,
+        prompt_eval_count: chatMessage(apiRequest) ? 1 : 0,
         eval_count: content.length,
         eval_duration: 0,
       };
-
-      if (request.body?.stream === false) return response.json(result);
-
-      response.type('application/x-ndjson');
-      return response.send(`${JSON.stringify({ ...result, done: false })}\n${JSON.stringify(result)}\n`);
-    }
-
-    if (path === '/tags') return response.json({ models: [createModel()] });
-    if (path === '/ps') return response.json({ models: [] });
-
-    if (path === '/show') {
-      const model = requestedModel(request);
-      return response.json({
-        ...createModel(model),
-        modelfile: `FROM ${model}`,
-        parameters: '',
-        template: '{{ .Prompt }}',
-        system: '',
-        license: 'stub',
-        capabilities: ['completion'],
+      if (body.stream === false) return jsonResponse(responseBody);
+      return new Response(`${JSON.stringify({ ...responseBody, done: false })}\n${JSON.stringify(responseBody)}\n`, {
+        headers: { 'content-type': 'application/x-ndjson; charset=utf-8', 'cache-control': 'no-store' },
       });
     }
 
-    if (path === '/recommend' || path === '/recommend-model' || path === '/recommend_model') {
-      return response.json({
-        model: defaultModelName,
-        models: [createModel()],
-        reason: 'Stub recommendation; replace with model selection logic.',
+    try {
+      const result = await proxyChat(apiRequest, env);
+      const responseBody = {
+        model: result.model,
+        created_at: new Date().toISOString(),
+        message: {
+          role: 'assistant',
+          content: withConversationSession(result.content, result.conversationId),
+        },
+        done: true,
+        done_reason: 'stop',
+        total_duration: result.totalDuration,
+        load_duration: 0,
+        prompt_eval_count: estimateTokenCount(chatMessage(apiRequest)),
+        prompt_eval_duration: 0,
+        eval_count: result.quotaUsage?.raw_credits_used ?? estimateTokenCount(result.content),
+        eval_duration: result.totalDuration,
+      };
+      if (body.stream === false) return jsonResponse(responseBody);
+      const finalChunk = { ...responseBody, message: { role: 'assistant', content: '' } };
+      return new Response(`${JSON.stringify({ ...responseBody, done: false })}\n${JSON.stringify(finalChunk)}\n`, {
+        headers: { 'content-type': 'application/x-ndjson; charset=utf-8', 'cache-control': 'no-store' },
       });
+    } catch (error) {
+      return errorResponse(error);
     }
+  }
 
-    return next();
-  };
+  if (path === '/show' && request.method === 'POST') {
+    const model = requestedModel(apiRequest);
+    return jsonResponse({
+      ...createModel(model),
+      modelfile: `FROM ${model}`,
+      parameters: '',
+      template: '{{ .Prompt }}',
+      system: '',
+      license: 'stub',
+      capabilities: ['completion'],
+    });
+  }
+
+  if (request.method === 'GET' && path === '/tags') return jsonResponse({ models: [createModel()] });
+  if (request.method === 'GET' && path === '/ps') return jsonResponse({ models: [] });
+  if (request.method === 'GET' && ['/recommend', '/recommend-model', '/recommend_model'].includes(path)) {
+    return jsonResponse({
+      model: defaultModelName,
+      models: [createModel()],
+      reason: 'Stub recommendation; replace with model selection logic.',
+    });
+  }
+  return jsonResponse({ error: 'Not found' }, 404);
 }

@@ -10,13 +10,18 @@
     "test-chat": "node src/test-chat.js",
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
+    "dev:worker": "wrangler dev --ip 127.0.0.1 --port 11434",
+    "deploy": "wrangler deploy",
     "test-api": "node --test src/server.test.js",
     "test-tool-calling": "node --test src/tool-calling.test.js",
+    "test-worker": "node --test src/worker.test.js",
     "test": "playwright test"
   },
   "dependencies": {
     "express": "^5.1.0",
-    "handlebars": "^4.7.9",
     "playwright": "^1.55.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.141.0"
   }
 }

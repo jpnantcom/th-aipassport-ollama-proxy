@@ -1,0 +1,26 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "thpassport-ollama-api",
+	"main": "src/worker.js",
+	"compatibility_date": "2026-09-26",
+	"workers_dev": true,
+	"vars": {
+		"AIPASS_BASE_URL": "https://de.aipass.net",
+		"AIPASS_USER_AGENT": "Playwright/1.63.0 (x64; windows 10.0) node/26.7",
+		"AUTH_OBJECT_KEY": "auth/storage-state.json"
+	},
+	"r2_buckets": [
+		{
+			"binding": "AUTH_BUCKET",
+			"bucket_name": "thpassport-auth"
+		}
+	],
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 0.1,
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.1
+		}
+	}
+}

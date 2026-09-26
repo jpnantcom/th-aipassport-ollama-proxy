@@ -58,3 +58,16 @@ test('write_file action remains available for the caller to execute', () => {
 
   assert.equal(finalAnswerFromAction(actionResponse), actionResponse);
 });
+
+test('initial prompt preserves a plain user request when no tools are declared', () => {
+  const prompt = initialConversationMessage({
+    body: {
+      system: 'Answer clearly.',
+      messages: [{ role: 'user', content: 'Say hello.' }],
+    },
+  }, 'Say hello.');
+
+  assert.match(prompt, /Answer clearly\./);
+  assert.match(prompt, /Say hello\./);
+  assert.doesNotMatch(prompt, /generate_answer/);
+});
